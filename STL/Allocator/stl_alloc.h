@@ -131,14 +131,16 @@ __STL_BEGIN_NAMESPACE
 # endif
 #endif
 
+
+/////////////////一级空间配置器开始///////////////
 template <int inst>
 class __malloc_alloc_template {
 
 private:
 
-static void *oom_malloc(size_t);
+static void *oom_malloc(size_t);			//申请内存(当allocate失败时调用),申请失败时会抛出异常
 
-static void *oom_realloc(void *, size_t);
+static void *oom_realloc(void *, size_t);	//追加内存,同上
 
 #ifndef __STL_STATIC_TEMPLATE_MEMBER_BUG
     static void (* __malloc_alloc_oom_handler)();
@@ -146,6 +148,7 @@ static void *oom_realloc(void *, size_t);
 
 public:
 
+//申请空间,失败时调用oom_malloc函数
 static void * allocate(size_t n)
 {
     void *result = malloc(n);
@@ -153,11 +156,13 @@ static void * allocate(size_t n)
     return result;
 }
 
+//释放空间,内部调用free
 static void deallocate(void *p, size_t /* n */)
 {
     free(p);
 }
 
+//追加空间,失败时调用oom_realloc函数
 static void * reallocate(void *p, size_t /* old_sz */, size_t new_sz)
 {
     void * result = realloc(p, new_sz);
@@ -165,6 +170,7 @@ static void * reallocate(void *p, size_t /* old_sz */, size_t new_sz)
     return result;
 }
 
+//设置句柄函数,
 static void (* set_malloc_handler(void (*f)()))()
 {
     void (* old)() = __malloc_alloc_oom_handler;
@@ -181,21 +187,26 @@ template <int inst>
 void (* __malloc_alloc_template<inst>::__malloc_alloc_oom_handler)() = 0;
 #endif
 
+//申请空间,默认情况下,申请失败直接抛出异常
+//如果有了句柄函数,会调用句柄函数释放内存后,继续申请
+//PS:如果句柄函数释放不出来内存,那程序就会陷入死循环,具体细节请看源代码
 template <int inst>
 void * __malloc_alloc_template<inst>::oom_malloc(size_t n)
 {
     void (* my_malloc_handler)();
     void *result;
 
-    for (;;) {
+    for (;;) {		//死循环!!!
         my_malloc_handler = __malloc_alloc_oom_handler;
-        if (0 == my_malloc_handler) { __THROW_BAD_ALLOC; }
-        (*my_malloc_handler)();
-        result = malloc(n);
+        if (0 == my_malloc_handler) { __THROW_BAD_ALLOC;}	//默认情况下,malloc_handler没有被设置,因此malloc失败,会抛出异常
+        (*my_malloc_handler)();		//因为这句代码在死循环中写着,
+									//所以我猜这个函数应该可以通过某种方式释放内存,
+									//否则这个程序就会一直陷入死循环
+        result = malloc(n);			//继续malloc内存
         if (result) return(result);
     }
 }
-
+//追加空间,同上
 template <int inst>
 void * __malloc_alloc_template<inst>::oom_realloc(void *p, size_t n)
 {
@@ -211,21 +222,36 @@ void * __malloc_alloc_template<inst>::oom_realloc(void *p, size_t n)
     }
 }
 
-typedef __malloc_alloc_template<0> malloc_alloc;
+/////////////////一级空间配置器结束///////////////
 
+/*
+一级空间配置器总结:
+	一级空间配置器,其实就是对malloc与free的一层封装,
+	与malloc、free函数不同的是,当malloc失败时,它可以调用__malloc_alloc_oom_handler函数通过某种方式释放内存(默认抛异常)
+*/
+
+
+typedef __malloc_alloc_template<0> malloc_alloc;
+/////////////////对空间配置器的一层封装////////////////////
 template<class T, class Alloc>
 class simple_alloc {
 
 public:
+	//类似于new[],但没有调用构造函数,Why????
     static T *allocate(size_t n)
                 { return 0 == n? 0 : (T*) Alloc::allocate(n * sizeof (T)); }
-    static T *allocate(void)
+    //类似于new,同上
+	static T *allocate(void)
                 { return (T*) Alloc::allocate(sizeof (T)); }
-    static void deallocate(T *p, size_t n)
+    //类似于delete[],但没有调用析构函数,Why????
+	static void deallocate(T *p, size_t n)
                 { if (0 != n) Alloc::deallocate(p, n * sizeof (T)); }
-    static void deallocate(T *p)
+    //类似于delete,同上
+	static void deallocate(T *p)
                 { Alloc::deallocate(p, sizeof (T)); }
 };
+//////////////////对空间配置器的一层封装//////////////////////////////
+
 
 // Allocator adaptor to check size arguments for debugging.
 // Reports errors using assert.  Checking can be disabled with
@@ -310,6 +336,9 @@ typedef malloc_alloc single_client_alloc;
   enum {__NFREELISTS = __MAX_BYTES/__ALIGN};
 #endif
 
+
+
+///////////////////二级空间配置器主干开始//////////////////////////////
 template <bool threads, int inst>
 class __default_alloc_template {
 
@@ -317,39 +346,54 @@ private:
   // Really we should use static const int x = N
   // instead of enum { x = N }, but few compilers accept the former.
 # ifndef __SUNPRO_CC
-    enum {__ALIGN = 8};
-    enum {__MAX_BYTES = 128};
-    enum {__NFREELISTS = __MAX_BYTES/__ALIGN};
+    enum {__ALIGN = 8};								//排列间隔,每块都是8字节的倍数
+    enum {__MAX_BYTES = 128};						//最大值,也就是8、16、24....128
+    enum {__NFREELISTS = __MAX_BYTES/__ALIGN};		//自由链表的大小(16)
 # endif
+
+	//向8的倍数对齐,
+	//比如: 输入1-7,输出8; 输入9-15,输出16; 输入17-23,输出24....
   static size_t ROUND_UP(size_t bytes) {
         return (((bytes) + __ALIGN-1) & ~(__ALIGN - 1));
   }
 __PRIVATE:
+  //自由链表节点定义
   union obj {
-        union obj * free_list_link;
-        char client_data[1];    /* The client sees this.        */
+        union obj * free_list_link;		//指向下一个链表
+        char client_data[1];    /* The client sees this.*/ //不知道啥意思,后面也没用到,给客户看的?
   };
 private:
+	//自由链表
 # ifdef __SUNPRO_CC
     static obj * __VOLATILE free_list[]; 
         // Specifying a size results in duplicate def for 4.1
 # else
     static obj * __VOLATILE free_list[__NFREELISTS]; 
 # endif
+
+	//获取在自由链表中的下标
+	//比如:
+	//1-7  ——  0
+	//8-15	—— 1
+	//17-23 —— 2
+	//...
   static  size_t FREELIST_INDEX(size_t bytes) {
         return (((bytes) + __ALIGN-1)/__ALIGN - 1);
   }
 
   // Returns an object of size n, and optionally adds to size n free list.
+  //返回一个对象的大小,有多余的挂在自由链表(这翻译的真难受,具体还是看代码吧,下同)
   static void *refill(size_t n);
   // Allocates a chunk for nobjs of size size.  nobjs may be reduced
+  //申请大块内存,nobjs可能会减小
   // if it is inconvenient to allocate the requested number.
+  //内存池里剩下几个元素,就分配几个
   static char *chunk_alloc(size_t size, int &nobjs);
 
   // Chunk allocation state.
-  static char *start_free;
-  static char *end_free;
-  static size_t heap_size;
+  static char *start_free;		//内存池的开始
+  static char *end_free;		//内存池的结束
+  static size_t heap_size;		//从系统堆中分配的总数
 
 # ifdef __STL_SGI_THREADS
     static volatile unsigned long __node_allocator_lock;
@@ -387,11 +431,14 @@ private:
 public:
 
   /* n must be > 0      */
+
+	//申请内存,采取头删的形式,从自由链表中获取内存块
   static void * allocate(size_t n)
   {
     obj * __VOLATILE * my_free_list;
     obj * __RESTRICT result;
 
+	//如果这个值大于__MAX_BYTES(128),就调用一级空间配置器
     if (n > (size_t) __MAX_BYTES) {
         return(malloc_alloc::allocate(n));
     }
@@ -405,19 +452,21 @@ public:
 #       endif
     result = *my_free_list;
     if (result == 0) {
+		//自由链表中没有东西,调用refill(从内存池中取对象,并将多余的挂入自由链表)
         void *r = refill(ROUND_UP(n));
         return r;
     }
-    *my_free_list = result -> free_list_link;
+    *my_free_list = result -> free_list_link;	//头删
     return (result);
   };
 
+  //释放内存到头插自由链表
   /* p may not be 0 */
   static void deallocate(void *p, size_t n)
   {
     obj *q = (obj *)p;
     obj * __VOLATILE * my_free_list;
-
+	//如果大于128字节,调用一级空间配置器
     if (n > (size_t) __MAX_BYTES) {
         malloc_alloc::deallocate(p, n);
         return;
@@ -428,6 +477,8 @@ public:
         /*REFERENCED*/
         lock lock_instance;
 #       endif /* _NOTHREADS */
+
+	//将节点头插进去
     q -> free_list_link = *my_free_list;
     *my_free_list = q;
     // lock is released here
@@ -443,38 +494,57 @@ typedef __default_alloc_template<false, 0> single_client_alloc;
 
 
 /* We allocate memory in large chunks in order to avoid fragmenting     */
+//我们申请大块内存为了避免分段？(内存碎片吧!)
 /* the malloc heap too much.                                            */
+//
 /* We assume that size is properly aligned.                             */
+//我们假设size适当的被均衡开
 /* We hold the allocation lock.                                         */
+//.....
+//并没有看懂要搞什么鬼,还是看代码吧!
+
+//申请大块内存
 template <bool threads, int inst>
 char*
 __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
 {
     char * result;
-    size_t total_bytes = size * nobjs;
-    size_t bytes_left = end_free - start_free;
+    size_t total_bytes = size * nobjs;			//总共要申请的字节数
+    size_t bytes_left = end_free - start_free;	//内存池中剩余的字节数
 
+	//内存充足,直接分配
     if (bytes_left >= total_bytes) {
         result = start_free;
         start_free += total_bytes;
         return(result);
+
+	//不够分配total_byte,但可以分配一个,那就分配一个出来
     } else if (bytes_left >= size) {
         nobjs = bytes_left/size;
         total_bytes = size * nobjs;
         result = start_free;
         start_free += total_bytes;
         return(result);
+
+	//内存池一个都分配不出来(100块都不给我!!!!!)
     } else {
+
         size_t bytes_to_get = 2 * total_bytes + ROUND_UP(heap_size >> 4);
         // Try to make use of the left-over piece.
+		//内存中还有剩余
         if (bytes_left > 0) {
+			//全部挂在自由链表上
             obj * __VOLATILE * my_free_list =
                         free_list + FREELIST_INDEX(bytes_left);
 
             ((obj *)start_free) -> free_list_link = *my_free_list;
             *my_free_list = (obj *)start_free;
         }
+
+		//内存池已空,重新开辟内存
         start_free = (char *)malloc(bytes_to_get);
+
+		//内存开不出来了,在自由链表中取
         if (0 == start_free) {
             int i;
             obj * __VOLATILE * my_free_list, *p;
@@ -488,19 +558,26 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
                     *my_free_list = p -> free_list_link;
                     start_free = (char *)p;
                     end_free = start_free + i;
+					//从自由链表中分配到了内存
+					//把获取到的内存,递归分配出去(代码复用)
                     return(chunk_alloc(size, nobjs));
                     // Any leftover piece will eventually make it to the
                     // right free list.
                 }
             }
 	    end_free = 0;	// In case of exception.
+
+			//山穷水尽,最后一根救命稻草,调用一级空间配置器
+			//试试,是否有办法能释放出一点内存
             start_free = (char *)malloc_alloc::allocate(bytes_to_get);
             // This should either throw an
             // exception or remedy the situation.  Thus we assume it
             // succeeded.
+			//(这里应该不是抛出一个异常就是会纠正当前状况,因此我们假设它成功了)
         }
         heap_size += bytes_to_get;
         end_free = start_free + bytes_to_get;
+		//把获取到的内存,递归分配出去(代码复用)
         return(chunk_alloc(size, nobjs));
     }
 }
@@ -509,23 +586,29 @@ __default_alloc_template<threads, inst>::chunk_alloc(size_t size, int& nobjs)
 /* Returns an object of size n, and optionally adds to size n free list.*/
 /* We assume that n is properly aligned.                                */
 /* We hold the allocation lock.                                         */
+
+//
 template <bool threads, int inst>
 void* __default_alloc_template<threads, inst>::refill(size_t n)
 {
     int nobjs = 20;
-    char * chunk = chunk_alloc(n, nobjs);
+    char * chunk = chunk_alloc(n, nobjs);	//分配20个内存块
     obj * __VOLATILE * my_free_list;
     obj * result;
     obj * current_obj, * next_obj;
     int i;
 
+	//如果只分配到一个,直接返回
     if (1 == nobjs) return(chunk);
     my_free_list = free_list + FREELIST_INDEX(n);
 
     /* Build free list in chunk */
+	//至少分配了2个,第一个内存块用作返回
       result = (obj *)chunk;
+	  //第二个内存块放在my_free_list位置
       *my_free_list = next_obj = (obj *)(chunk + n);
-      for (i = 1; ; i++) {
+      //剩下的挂在my_free_list的后面
+	  for (i = 1; ; i++) {
         current_obj = next_obj;
         next_obj = (obj *)((char *)next_obj + n);
         if (nobjs - 1 == i) {
@@ -546,17 +629,20 @@ __default_alloc_template<threads, inst>::reallocate(void *p,
 {
     void * result;
     size_t copy_sz;
-
+	//旧与新都大于__MAX_BYTES(128),调用一级空间配置器
     if (old_sz > (size_t) __MAX_BYTES && new_sz > (size_t) __MAX_BYTES) {
         return(realloc(p, new_sz));
     }
+	//如果旧的与新的相等,直接返回
     if (ROUND_UP(old_sz) == ROUND_UP(new_sz)) return(p);
-    result = allocate(new_sz);
-    copy_sz = new_sz > old_sz? old_sz : new_sz;
-    memcpy(result, p, copy_sz);
-    deallocate(p, old_sz);
+    
+	result = allocate(new_sz);	//申请新空间
+    copy_sz = new_sz > old_sz? old_sz : new_sz;	//得到较大的那个
+    memcpy(result, p, copy_sz);	//拷贝
+    deallocate(p, old_sz);	//释放原有空间
     return(result);
 }
+///////////////////二级空间配置器主干结束//////////////////////////////
 
 #ifdef _PTHREADS
     template <bool threads, int inst>
